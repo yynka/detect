@@ -1,0 +1,18 @@
+{
+  "ip_address": "192.168.1.124",
+  "hostname": "ml700.lan",
+  "mac_address": "08:1f:3f:03:a3:03",
+  "vendor": "Unknown",
+  "computer_name": null,
+  "os_version": null,
+  "last_user": null,
+  "first_seen": "2025-07-21T18:34:43.219085+00:00",
+  "last_seen": "2025-07-21T18:34:43.219173+00:00",
+  "platform": "Unknown",
+  "is_accessible": false,
+  "services": [],
+  "shared_resources": [],
+  "open_ports": {
+    "22": "SSH"
+  }
+}
