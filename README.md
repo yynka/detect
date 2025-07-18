@@ -5,10 +5,10 @@ Detects devices on your network that respond to ARP but not to higher-layer prot
 ## What It Detects
 
 These scripts identify "hidden" or "stealth" devices that:
-- ✅ Respond to ARP requests (Layer 2) 
-- ❌ Don't respond to ICMP pings
-- ❌ Don't respond to UDP probes (mDNS, SSDP, NetBIOS)
-- ❌ Don't respond to TCP SYN probes (ports 80, 443)
+- Respond to ARP requests (Layer 2) 
+- Don't respond to ICMP pings
+- Don't respond to UDP probes (mDNS, SSDP, NetBIOS)
+- Don't respond to TCP SYN probes (ports 80, 443)
 
 Such devices may have:
 - Firewall configurations blocking higher-layer protocols
