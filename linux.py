@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Tuple
 
 import psutil
@@ -170,7 +170,7 @@ def main() -> None:
     
     hidden = discover_hidden(subnet)
     
-    timestamp = datetime.utcnow().isoformat() + "Z"
+    timestamp = datetime.now(timezone.utc).isoformat()
     report = {
         "timestamp": timestamp,
         "subnet": subnet,
