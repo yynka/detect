@@ -1,132 +1,234 @@
+"""
+Linux network stealth device detector.
+
+Detects devices on the network that respond to ARP but not to higher-layer
+protocols (ICMP, UDP, TCP), which may indicate security configurations,
+firewalls, or stealth settings.
+"""
+
+from __future__ import annotations
+
 import argparse
+import concurrent.futures as fut
+import ipaddress
 import json
 import os
+import socket
 import subprocess
 import sys
-import concurrent.futures as fut
-from datetime import datetime
-
 from collections import namedtuple
-from ipaddress import ip_network
+from datetime import datetime
+from typing import List, Tuple
+
+import psutil  # cross-platform NIC inspection
 
 try:
-    from scapy.all import ARP, Ether, srp, sr1, IP, ICMP, UDP, TCP
+    from scapy.all import (  # type: ignore
+        ARP,
+        ICMP,
+        IP,
+        TCP,
+        UDP,
+        Ether,
+        sr1,
+        srp,
+    )
 except ImportError:
-    print("[!] Scapy not found – pip install scapy", file=sys.stderr)
-    sys.exit(1)
+    sys.exit("[!] scapy is required: pip install scapy")
 
 # Optional pretty output
 try:
-    from rich import print as rprint
-    from rich.table import Table
-except ImportError:
+    from rich import print as rprint  # type: ignore
+    from rich.table import Table  # type: ignore
+except ImportError:  # pragma: no cover
     rprint = print  # type: ignore
-    Table = None    # type: ignore
+    Table = None  # type: ignore
 
+# --------------------------- Constants ------------------------------------
 
-ProbeResult = namedtuple("ProbeResult", "ip mac replied_arp replied_icmp replied_udp replied_tcp vendor")
-
-UDP_PROBES = [  # port, payload
-    (5353, b"\x00"),     # mDNS
+UDP_PROBES: List[Tuple[int, bytes]] = [
+    (5353, b"\x00"),  # mDNS
     (1900, b"M-SEARCH * HTTP/1.1\r\n\r\n"),  # SSDP
-    (137, b"\x00"),      # NetBIOS
+    (137, b"\x00"),  # NetBIOS Name Service
 ]
 
-TCP_PROBES = [80, 443]  # Could be extended
+TCP_PROBES: List[int] = [80, 443]
 
+ProbeResult = namedtuple(
+    "ProbeResult",
+    "ip mac replied_icmp replied_udp replied_tcp vendor",
+)
 
-def run_arp_scan(net: str) -> list[tuple[str, str]]:
-    """Return list of (ip, mac) discovered via ARP."""
+# --------------------------- Privilege check ------------------------------
+
+def ensure_root() -> None:
+    """Ensure script is running with root privileges for raw socket access."""
+    if os.geteuid() != 0:
+        sys.exit("[!] Run with sudo/root – raw socket access required")
+
+# --------------------------- Subnet autodetection ------------------------
+
+def auto_subnet() -> str:
+    """
+    Return the first suitable IPv4 subnet in CIDR form.
+    
+    Falls back to ip route command if psutil detection fails.
+    """
+    # Try psutil first (more reliable)
+    try:
+        for iface, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and not addr.address.startswith(("127.", "169.254.")):
+                    try:
+                        net = ipaddress.IPv4Network(f"{addr.address}/{addr.netmask}", strict=False)
+                        if net.prefixlen < 31:
+                            return str(net)
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    
+    # Fallback to ip route command
+    try:
+        route_out = subprocess.check_output(["ip", "route"], text=True)
+        for line in route_out.splitlines():
+            if "kernel" in line or "src" in line:
+                parts = line.split()
+                if parts and "/" in parts[0]:
+                    return parts[0]
+    except Exception:
+        pass
+    
+    raise RuntimeError("Could not autodetect subnet; please specify one manually")
+
+# --------------------------- Network probes -------------------------------
+
+def run_arp_scan(net: str) -> List[Tuple[str, str]]:
+    """
+    Perform ARP scan on the given network.
+    
+    Args:
+        net: Network in CIDR notation (e.g., '192.168.1.0/24')
+        
+    Returns:
+        List of (ip, mac) tuples for devices that responded to ARP
+    """
     pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(net))
     answered, _ = srp(pkt, timeout=2, retry=1, verbose=False)
     return [(rcv.psrc, rcv.hwsrc) for _, rcv in answered]
 
-
 def icmp_probe(ip: str) -> bool:
+    """Test if device responds to ICMP ping."""
     pkt = IP(dst=ip) / ICMP()
-    ans = sr1(pkt, timeout=1, verbose=False)
-    return ans is not None
-
+    return sr1(pkt, timeout=1, verbose=False) is not None
 
 def udp_probe(ip: str) -> bool:
+    """Test if device responds to UDP probes on common ports."""
     for port, payload in UDP_PROBES:
         pkt = IP(dst=ip) / UDP(dport=port, sport=port) / payload
-        ans = sr1(pkt, timeout=1, verbose=False)
-        if ans:
+        if sr1(pkt, timeout=1, verbose=False):
             return True
     return False
-
 
 def tcp_syn_probe(ip: str) -> bool:
+    """Test if device responds to TCP SYN probes on common ports."""
     for port in TCP_PROBES:
         pkt = IP(dst=ip) / TCP(dport=port, flags="S")
-        ans = sr1(pkt, timeout=1, verbose=False)
-        if ans:
+        if sr1(pkt, timeout=1, verbose=False):
             return True
     return False
 
+# --------------------------- Optional OUI lookup --------------------------
 
-def oui_lookup(mac: str) -> str:
-    try:
-        import netaddr
-        return netaddr.EUI(mac).oui.registration().org
-    except Exception:
+try:
+    import netaddr  # type: ignore
+
+    def oui_lookup(mac: str) -> str:  # pragma: no cover
+        """Look up device vendor from MAC address OUI."""
+        try:
+            return netaddr.EUI(mac).oui.registration().org
+        except Exception:
+            return "Unknown"
+except ImportError:  # pragma: no cover
+    def oui_lookup(mac: str) -> str:
         return "Unknown"
 
+# --------------------------- Composite probe ------------------------------
 
-def probe_host(ip_mac: tuple[str, str]) -> ProbeResult:
+def probe_host(ip_mac: Tuple[str, str]) -> ProbeResult:
+    """
+    Probe a single host with multiple protocols.
+    
+    Args:
+        ip_mac: Tuple of (ip_address, mac_address)
+        
+    Returns:
+        ProbeResult with response information
+    """
     ip, mac = ip_mac
     return ProbeResult(
         ip=ip,
         mac=mac,
-        replied_arp=True,  # by definition
         replied_icmp=icmp_probe(ip),
         replied_udp=udp_probe(ip),
         replied_tcp=tcp_syn_probe(ip),
         vendor=oui_lookup(mac),
     )
 
+# --------------------------- Discovery orchestrator ----------------------
 
-def discover_hidden(net: str):
+def discover_hidden(net: str) -> List[ProbeResult]:
+    """
+    Discover 'hidden' devices on the network.
+    
+    Hidden devices are those that respond to ARP but not to higher-layer
+    protocols, which may indicate security configurations or stealth settings.
+    
+    Args:
+        net: Network in CIDR notation
+        
+    Returns:
+        List of ProbeResult objects for hidden devices
+    """
     arp_entries = run_arp_scan(net)
-    hidden = []
+    hidden: List[ProbeResult] = []
+    
     with fut.ThreadPoolExecutor(max_workers=32) as pool:
         for res in pool.map(probe_host, arp_entries):
-            # A device is considered hidden if it responded to ARP but not to any higher layer probe
+            # Device is hidden if it responds to ARP but not to higher protocols
             if not (res.replied_icmp or res.replied_udp or res.replied_tcp):
                 hidden.append(res)
+    
     return hidden
 
+# --------------------------- CLI entry point ------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Detect hidden devices on local network")
-    parser.add_argument("subnet", nargs="?", help="CIDR subnet to scan, e.g. 192.168.1.0/24")
-
+def main() -> None:  # pragma: no cover
+    """Main entry point for the Linux stealth device detector."""
+    parser = argparse.ArgumentParser(
+        description="Detect stealth/hidden devices on Linux networks"
+    )
+    parser.add_argument(
+        "subnet", 
+        nargs="?", 
+        help="CIDR subnet to scan, e.g. 192.168.1.0/24"
+    )
+    
     args = parser.parse_args()
-    subnet = args.subnet
-
-    if not subnet:
-        # Attempt to detect active subnet via `ip route`
-        try:
-            route_out = subprocess.check_output(["ip", "route"], text=True)
-            default_line = next(l for l in route_out.splitlines() if "kernel" in l or "src" in l)
-            subnet = default_line.split()[0]
-        except Exception:
-            print("[!] Could not determine subnet automatically – please supply one", file=sys.stderr)
-            sys.exit(1)
-
+    subnet = args.subnet or auto_subnet()
+    
     hidden = discover_hidden(subnet)
-
+    
     timestamp = datetime.utcnow().isoformat() + "Z"
     report = {
         "timestamp": timestamp,
         "subnet": subnet,
         "hidden_count": len(hidden),
-        "devices": [res._asdict() for res in hidden],
+        "devices": [d._asdict() for d in hidden],
     }
-
-    # Console output
-    if Table and hidden:
+    
+    # Human-friendly output
+    if hidden and Table:
         table = Table(title=f"Hidden devices on {subnet} ({len(hidden)})")
         table.add_column("IP", style="cyan")
         table.add_column("MAC", style="magenta")
@@ -135,13 +237,11 @@ def main():
             table.add_row(d.ip, d.mac, d.vendor)
         rprint(table)
     else:
-        print(json.dumps(report, indent=2))
-
-    # Always dump JSON for programmatic use
+        rprint(json.dumps(report, indent=2))
+    
+    # Machine-readable JSON output (final line)
     print(json.dumps(report))
 
 if __name__ == "__main__":
-    if os.geteuid() != 0:
-        print("[!] This script needs to run with root privileges to send raw packets", file=sys.stderr)
-        sys.exit(1)
+    ensure_root()
     main()
